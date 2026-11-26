@@ -1,40 +1,49 @@
+import json
 import os
-import tempfile
 import time
+from contextlib import contextmanager
+
+import oracledb
 from fastapi import FastAPI, HTTPException
-from pymongo import MongoClient
 
-app = FastAPI(title="Banking AI Anomaly Scorer (MongoDB)", version="1.0.0")
+app = FastAPI(title="Banking AI Anomaly Scorer (Oracle)", version="1.0.0")
 
-# MongoDB settings injected via Code Engine secret
-MONGO_URI = os.getenv("MONGO_URI")
-MONGO_DB = os.getenv("MONGO_DB", "bankdemo")
-MONGO_CA_PEM = os.getenv("MONGO_CA_PEM")          # PEM text of the CA
-MONGO_MAX_POOL = int(os.getenv("MONGO_MAX_POOL", "10"))
+# Oracle settings injected via Code Engine secret
+ORACLE_DSN = os.getenv("ORACLE_DSN")            # host:port/service
+ORACLE_USER = os.getenv("ORACLE_USER", "bank_app")
+ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
+# pool   = one shared pool per process (default)
+# single = new connection on every request (how the Db2 scorer behaves)
+POOL_MODE = os.getenv("ORACLE_POOL_MODE", "pool").lower()
+POOL_MAX = int(os.getenv("ORACLE_POOL_MAX", "10"))
+MODEL_VERSION = "rules-v1"
 
-_client = None
+_pool = None
 
 
-def get_db():
-    """One pooled MongoClient per process, created on first use.
-    (The Db2 version opens a new connection on every request.)"""
-    global _client
-    if not MONGO_URI:
-        return None
+@contextmanager
+def get_conn():
+    """Yield one connection. Pool mode reuses connections, single mode does not."""
+    global _pool
+    if not (ORACLE_DSN and ORACLE_PASSWORD):
+        raise RuntimeError("ORACLE_DSN / ORACLE_PASSWORD not set")
+    if POOL_MODE == "single":
+        conn = oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD,
+                                dsn=ORACLE_DSN, tcp_connect_timeout=10)
+        try:
+            yield conn
+        finally:
+            conn.close()
+        return
+    if _pool is None:
+        _pool = oracledb.create_pool(user=ORACLE_USER, password=ORACLE_PASSWORD,
+                                     dsn=ORACLE_DSN, min=1, max=POOL_MAX, increment=1,
+                                     tcp_connect_timeout=10)
+    conn = _pool.acquire()
     try:
-        if _client is None:
-            kw = {"maxPoolSize": MONGO_MAX_POOL, "serverSelectionTimeoutMS": 5000,
-                  "connectTimeoutMS": 5000, "socketTimeoutMS": 15000}
-            if MONGO_CA_PEM:
-                f = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
-                f.write(MONGO_CA_PEM)
-                f.close()
-                kw["tlsCAFile"] = f.name
-            _client = MongoClient(MONGO_URI, **kw)
-        return _client[MONGO_DB]
-    except Exception as e:
-        print(f"MongoDB Connection Error: {type(e).__name__}")
-        return None
+        yield conn
+    finally:
+        _pool.release(conn)
 
 
 # ---- scoring: copied unchanged from the Db2 version --------------------------
@@ -88,62 +97,149 @@ def score_transaction_risk(amount: float, country: str, is_dormant: bool, count_
     }
 
 
+ACCT_STATUS_SQL = "SELECT status FROM account WHERE acct_id = :1"
+RECENT_TXN_SQL = ("SELECT txn_id, amount, country, channel FROM txn WHERE acct_id = :1 "
+                  "ORDER BY txn_ts DESC, txn_id DESC FETCH FIRST 20 ROWS ONLY")
+
+
+def load_and_score(conn, account_id: int):
+    """Same reads as the Db2 and Mongo scorers, then the unchanged scoring function."""
+    cur = conn.cursor()
+    db_start = time.perf_counter()
+    cur.execute(ACCT_STATUS_SQL, [account_id])
+    row = cur.fetchone()
+    is_dormant = bool(row and row[0] and row[0].strip().upper() == "D")
+    cur.execute(RECENT_TXN_SQL, [account_id])
+    rows = cur.fetchall()
+    db_ms = round((time.perf_counter() - db_start) * 1000.0, 2)
+
+    transactions = [{
+        "txn_id": int(r[0]),
+        "amount": float(r[1]),
+        "country": r[2].strip() if r[2] else "N/A",
+        "reason": r[3].strip() if r[3] else "N/A",
+    } for r in rows]
+    if not transactions:
+        raise HTTPException(status_code=404,
+                            detail=f"No transactions found in Oracle for Account {account_id}")
+    latest = transactions[0]
+    result = score_transaction_risk(amount=latest["amount"], country=latest["country"],
+                                    is_dormant=is_dormant, count_recent=len(transactions))
+    return is_dormant, transactions, latest, result, db_ms
+
+
+def build_response(account_id, is_dormant, transactions, latest, result, db_ms, start_time):
+    return {
+        "account_id": account_id,
+        "is_dormant_account": is_dormant,
+        "latest_transaction": latest,
+        "total_analyzed_txns": len(transactions),
+        "ai_evaluation": result,
+        "latency_ms": round((time.perf_counter() - start_time) * 1000.0, 2),
+        "db_ms": db_ms,
+        "backend": "oracle",
+        "pool_mode": POOL_MODE,
+    }
+
+
 @app.get("/health")
 def health_check():
-    """Readiness probe used by Code Engine router."""
-    return {"status": "ready", "service": "banking-ai-inference", "backend": "mongodb"}
+    """Readiness probe used by Code Engine router. Does not touch the database."""
+    return {"status": "ready", "service": "banking-ai-inference", "backend": "oracle",
+            "pool_mode": POOL_MODE}
 
 
 @app.get("/score-account/{account_id}")
 def score_account(account_id: int):
+    """Read-only. Same contract as the Db2 and MongoDB scorers."""
     start_time = time.perf_counter()
-    db = get_db()
-
-    if db is None:
-        raise HTTPException(status_code=500, detail="MongoDB connection failed. Check MONGO_URI.")
-
     try:
-        db_start = time.perf_counter()
-        # 1. Account master status (Dormant vs Active)
-        acct_row = db.accounts.find_one({"_id": account_id}, {"status": 1})
-        is_dormant = (acct_row["status"].strip().upper() == "D") if acct_row and acct_row.get("status") else False
-
-        # 2. Recent transactions, newest first, same 20-row cap as the Db2 query
-        rows = list(db.transactions.find({"acct_id": account_id})
-                    .sort([("txn_ts", -1), ("_id", -1)]).limit(20))
-        db_ms = round((time.perf_counter() - db_start) * 1000.0, 2)
+        with get_conn() as conn:
+            parts = load_and_score(conn, account_id)
+    except HTTPException:
+        raise
     except Exception as e:
-        print(f"MongoDB Query Error: {type(e).__name__}")
-        raise HTTPException(status_code=503, detail="MongoDB query failed.")
+        print(f"Oracle Error: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Oracle query failed.")
+    return build_response(account_id, *parts, start_time)
 
-    transactions = [{
-        "txn_id": r["_id"],
-        "amount": float(r["amount"].to_decimal()),
-        "country": r["country"].strip() if r.get("country") else "N/A",
-        "reason": r["channel"].strip() if r.get("channel") else "N/A",
-    } for r in rows]
 
-    if not transactions:
-        raise HTTPException(status_code=404, detail=f"No transactions found in MongoDB for Account {account_id}")
+@app.post("/score-and-store/{account_id}")
+def score_and_store(account_id: int):
+    """Score the account, then keep the result in AI_RISK_SCORE (idempotent per
+    transaction and model version). PATTERNS is a native JSON column."""
+    start_time = time.perf_counter()
+    try:
+        with get_conn() as conn:
+            is_dormant, txns, latest, result, db_ms = load_and_score(conn, account_id)
+            cur = conn.cursor()
+            w0 = time.perf_counter()
+            bind = {"a": account_id, "t": latest["txn_id"], "m": MODEL_VERSION,
+                    "s": result["risk_score"], "l": result["risk_level"],
+                    "f": 1 if result["is_flagged"] else 0,
+                    "p": json.dumps(result["detected_patterns"])}
+            cur.execute("UPDATE ai_risk_score SET risk_score = :s, risk_level = :l, "
+                        "is_flagged = :f, patterns = JSON(:p), scored_at = SYSTIMESTAMP "
+                        "WHERE txn_id = :t AND model_version = :m", bind)
+            if cur.rowcount == 0:
+                cur.execute("INSERT INTO ai_risk_score (acct_id, txn_id, model_version, "
+                            "risk_score, risk_level, is_flagged, patterns) "
+                            "VALUES (:a, :t, :m, :s, :l, :f, JSON(:p))", bind)
+            conn.commit()
+            write_ms = round((time.perf_counter() - w0) * 1000.0, 2)
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Oracle Error: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Oracle write failed.")
+    out = build_response(account_id, is_dormant, txns, latest, result, db_ms, start_time)
+    out["stored"] = {"txn_id": latest["txn_id"], "model_version": MODEL_VERSION,
+                     "write_ms": write_ms}
+    return out
 
-    total_txns = len(transactions)
-    latest_txn = transactions[0]
-    inference_result = score_transaction_risk(
-        amount=latest_txn["amount"],
-        country=latest_txn["country"],
-        is_dormant=is_dormant,
-        count_recent=total_txns
-    )
 
-    latency_ms = round((time.perf_counter() - start_time) * 1000.0, 2)
+@app.get("/stored-scores/{account_id}")
+def stored_scores(account_id: int):
+    """Read the stored AI output back, including a query inside the JSON column."""
+    try:
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute("SELECT txn_id, model_version, risk_score, risk_level, is_flagged, "
+                        "patterns, scored_at, "
+                        "JSON_EXISTS(patterns, '$[*]?(@ == \"SUDDEN_ACTIVITY_ON_DORMANT_ACCOUNT\")') "
+                        "FROM ai_risk_score WHERE acct_id = :1 ORDER BY scored_at DESC "
+                        "FETCH FIRST 20 ROWS ONLY", [account_id])
+            rows = cur.fetchall()
+    except Exception as e:
+        print(f"Oracle Error: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Oracle query failed.")
+    return {"account_id": account_id, "count": len(rows), "scores": [{
+        "txn_id": int(r[0]), "model_version": r[1], "risk_score": float(r[2]),
+        "risk_level": r[3], "is_flagged": bool(r[4]), "patterns": r[5],
+        "scored_at": r[6].isoformat(), "dormant_pattern": bool(r[7]),
+    } for r in rows]}
 
-    return {
-        "account_id": account_id,
-        "is_dormant_account": is_dormant,
-        "latest_transaction": latest_txn,
-        "total_analyzed_txns": total_txns,
-        "ai_evaluation": inference_result,
-        "latency_ms": latency_ms,
-        "db_ms": db_ms,
-        "backend": "mongodb"
-    }
+
+@app.get("/similar/{txn_id}")
+def similar(txn_id: int, k: int = 10, approx: bool = False):
+    """AI Vector Search: k transactions closest to txn_id (cosine distance)."""
+    k = max(1, min(k, 50))
+    fetch = "FETCH APPROX FIRST %d ROWS ONLY" % k if approx else "FETCH FIRST %d ROWS ONLY" % k
+    sql = ("SELECT f.txn_id, t.acct_id, t.amount, t.country, t.txn_type, "
+           "VECTOR_DISTANCE(f.embedding, (SELECT embedding FROM txn_features WHERE txn_id = :1), "
+           "COSINE) AS dist FROM txn_features f JOIN txn t ON t.txn_id = f.txn_id "
+           "WHERE f.txn_id <> :2 ORDER BY dist " + fetch)
+    try:
+        t0 = time.perf_counter()
+        with get_conn() as conn:
+            cur = conn.cursor()
+            cur.execute(sql, [txn_id, txn_id])
+            rows = cur.fetchall()
+        ms = round((time.perf_counter() - t0) * 1000.0, 2)
+    except Exception as e:
+        print(f"Oracle Error: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="Oracle query failed.")
+    return {"txn_id": txn_id, "k": k, "approximate": approx, "query_ms": ms,
+            "neighbours": [{"txn_id": int(r[0]), "acct_id": int(r[1]), "amount": float(r[2]),
+                            "country": r[3].strip(), "txn_type": r[4].strip(),
+                            "distance": round(float(r[5]), 4)} for r in rows]}
