@@ -1,23 +1,43 @@
-
 import os
+import tempfile
 import time
 from fastapi import FastAPI, HTTPException
-import ibm_db
+from pymongo import MongoClient
 
-app = FastAPI(title="Banking AI Anomaly Scorer", version="1.0.0")
+app = FastAPI(title="Banking AI Anomaly Scorer (MongoDB)", version="1.0.0")
 
-# Db2 Connection String injected via Code Engine Environment Variable
-DB2_CONN_STRING = os.getenv("DB2_CONNECTION_STRING")
+# MongoDB settings injected via Code Engine secret
+MONGO_URI = os.getenv("MONGO_URI")
+MONGO_DB = os.getenv("MONGO_DB", "bankdemo")
+MONGO_CA_PEM = os.getenv("MONGO_CA_PEM")          # PEM text of the CA
+MONGO_MAX_POOL = int(os.getenv("MONGO_MAX_POOL", "10"))
 
-def get_db_connection():
-    if not DB2_CONN_STRING:
+_client = None
+
+
+def get_db():
+    """One pooled MongoClient per process, created on first use.
+    (The Db2 version opens a new connection on every request.)"""
+    global _client
+    if not MONGO_URI:
         return None
     try:
-        return ibm_db.connect(DB2_CONN_STRING, "", "")
+        if _client is None:
+            kw = {"maxPoolSize": MONGO_MAX_POOL, "serverSelectionTimeoutMS": 5000,
+                  "connectTimeoutMS": 5000, "socketTimeoutMS": 15000}
+            if MONGO_CA_PEM:
+                f = tempfile.NamedTemporaryFile("w", suffix=".pem", delete=False)
+                f.write(MONGO_CA_PEM)
+                f.close()
+                kw["tlsCAFile"] = f.name
+            _client = MongoClient(MONGO_URI, **kw)
+        return _client[MONGO_DB]
     except Exception as e:
-        print(f"Db2 Connection Error: {e}")
+        print(f"MongoDB Connection Error: {type(e).__name__}")
         return None
 
+
+# ---- scoring: copied unchanged from the Db2 version --------------------------
 def score_transaction_risk(amount: float, country: str, is_dormant: bool, count_recent: int = 1) -> dict:
     """
     AI Anomaly Scoring Engine:
@@ -67,52 +87,44 @@ def score_transaction_risk(amount: float, country: str, is_dormant: bool, count_
         "detected_patterns": detected_patterns or ["NORMAL_BEHAVIOR"]
     }
 
+
 @app.get("/health")
 def health_check():
     """Readiness probe used by Code Engine router."""
-    return {"status": "ready", "service": "banking-ai-inference"}
+    return {"status": "ready", "service": "banking-ai-inference", "backend": "mongodb"}
+
 
 @app.get("/score-account/{account_id}")
 def score_account(account_id: int):
     start_time = time.perf_counter()
-    conn = get_db_connection()
+    db = get_db()
 
-    if not conn:
-        raise HTTPException(status_code=500, detail="Db2 connection failed. Check DB2_CONNECTION_STRING.")
+    if db is None:
+        raise HTTPException(status_code=500, detail="MongoDB connection failed. Check MONGO_URI.")
 
-    # 1. Query Account Master Status (Dormant vs Active) from STD21189.ACCOUNT
-    acct_sql = "SELECT STATUS, BALANCE FROM STD21189.ACCOUNT WHERE ACCT_ID = ?"
-    acct_stmt = ibm_db.prepare(conn, acct_sql)
-    ibm_db.execute(acct_stmt, (account_id,))
-    acct_row = ibm_db.fetch_assoc(acct_stmt)
-    is_dormant = (acct_row["STATUS"].strip().upper() == "D") if acct_row and acct_row["STATUS"] else False
+    try:
+        db_start = time.perf_counter()
+        # 1. Account master status (Dormant vs Active)
+        acct_row = db.accounts.find_one({"_id": account_id}, {"status": 1})
+        is_dormant = (acct_row["status"].strip().upper() == "D") if acct_row and acct_row.get("status") else False
 
-    # 2. Query Recent Transactions from Ledger table STD21189.TXN
-    sql = """
-        SELECT TXN_ID, ACCT_ID, VARCHAR(TXN_TS) AS TXN_TS, AMOUNT, TXN_TYPE, COUNTRY, CHANNEL 
-        FROM STD21189.TXN 
-        WHERE ACCT_ID = ? 
-        ORDER BY TXN_TS DESC 
-        FETCH FIRST 20 ROWS ONLY
-    """
-    stmt = ibm_db.prepare(conn, sql)
-    ibm_db.execute(stmt, (account_id,))
+        # 2. Recent transactions, newest first, same 20-row cap as the Db2 query
+        rows = list(db.transactions.find({"acct_id": account_id})
+                    .sort([("txn_ts", -1), ("_id", -1)]).limit(20))
+        db_ms = round((time.perf_counter() - db_start) * 1000.0, 2)
+    except Exception as e:
+        print(f"MongoDB Query Error: {type(e).__name__}")
+        raise HTTPException(status_code=503, detail="MongoDB query failed.")
 
-    transactions = []
-    row = ibm_db.fetch_assoc(stmt)
-    while row:
-        transactions.append({
-            "txn_id": row["TXN_ID"],
-            "amount": float(row["AMOUNT"]),
-            "country": row["COUNTRY"].strip() if row["COUNTRY"] else "N/A",
-            "reason": row["CHANNEL"].strip() if row["CHANNEL"] else "N/A"
-        })
-        row = ibm_db.fetch_assoc(stmt)
-
-    ibm_db.close(conn)
+    transactions = [{
+        "txn_id": r["_id"],
+        "amount": float(r["amount"].to_decimal()),
+        "country": r["country"].strip() if r.get("country") else "N/A",
+        "reason": r["channel"].strip() if r.get("channel") else "N/A",
+    } for r in rows]
 
     if not transactions:
-        raise HTTPException(status_code=404, detail=f"No transactions found in Db2 for Account {account_id}")
+        raise HTTPException(status_code=404, detail=f"No transactions found in MongoDB for Account {account_id}")
 
     total_txns = len(transactions)
     latest_txn = transactions[0]
@@ -131,5 +143,7 @@ def score_account(account_id: int):
         "latest_transaction": latest_txn,
         "total_analyzed_txns": total_txns,
         "ai_evaluation": inference_result,
-        "latency_ms": latency_ms
+        "latency_ms": latency_ms,
+        "db_ms": db_ms,
+        "backend": "mongodb"
     }
