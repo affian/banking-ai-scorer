@@ -17,8 +17,16 @@ ORACLE_PASSWORD = os.getenv("ORACLE_PASSWORD")
 POOL_MODE = os.getenv("ORACLE_POOL_MODE", "pool").lower()
 POOL_MAX = int(os.getenv("ORACLE_POOL_MAX", "10"))
 MODEL_VERSION = "rules-v1"
+# BANK_APP owns no tables: resolve unqualified names in the BANK schema
+SCHEMA = os.getenv("ORACLE_SCHEMA", "bank")
 
 _pool = None
+
+
+def err_name(e):
+    """Exception class plus the ORA code if any. Never the message, which can echo input."""
+    code = getattr(getattr(e, "args", [None])[0], "full_code", "") if getattr(e, "args", None) else ""
+    return f"{type(e).__name__} {code}".strip()
 
 
 @contextmanager
@@ -30,6 +38,7 @@ def get_conn():
     if POOL_MODE == "single":
         conn = oracledb.connect(user=ORACLE_USER, password=ORACLE_PASSWORD,
                                 dsn=ORACLE_DSN, tcp_connect_timeout=10)
+        conn.current_schema = SCHEMA
         try:
             yield conn
         finally:
@@ -40,6 +49,7 @@ def get_conn():
                                      dsn=ORACLE_DSN, min=1, max=POOL_MAX, increment=1,
                                      tcp_connect_timeout=10)
     conn = _pool.acquire()
+    conn.current_schema = SCHEMA
     try:
         yield conn
     finally:
@@ -159,7 +169,7 @@ def score_account(account_id: int):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Oracle Error: {type(e).__name__}")
+        print(f"Oracle Error: {err_name(e)}")
         raise HTTPException(status_code=503, detail="Oracle query failed.")
     return build_response(account_id, *parts, start_time)
 
@@ -190,7 +200,7 @@ def score_and_store(account_id: int):
     except HTTPException:
         raise
     except Exception as e:
-        print(f"Oracle Error: {type(e).__name__}")
+        print(f"Oracle Error: {err_name(e)}")
         raise HTTPException(status_code=503, detail="Oracle write failed.")
     out = build_response(account_id, is_dormant, txns, latest, result, db_ms, start_time)
     out["stored"] = {"txn_id": latest["txn_id"], "model_version": MODEL_VERSION,
@@ -211,7 +221,7 @@ def stored_scores(account_id: int):
                         "FETCH FIRST 20 ROWS ONLY", [account_id])
             rows = cur.fetchall()
     except Exception as e:
-        print(f"Oracle Error: {type(e).__name__}")
+        print(f"Oracle Error: {err_name(e)}")
         raise HTTPException(status_code=503, detail="Oracle query failed.")
     return {"account_id": account_id, "count": len(rows), "scores": [{
         "txn_id": int(r[0]), "model_version": r[1], "risk_score": float(r[2]),
@@ -237,7 +247,7 @@ def similar(txn_id: int, k: int = 10, approx: bool = False):
             rows = cur.fetchall()
         ms = round((time.perf_counter() - t0) * 1000.0, 2)
     except Exception as e:
-        print(f"Oracle Error: {type(e).__name__}")
+        print(f"Oracle Error: {err_name(e)}")
         raise HTTPException(status_code=503, detail="Oracle query failed.")
     return {"txn_id": txn_id, "k": k, "approximate": approx, "query_ms": ms,
             "neighbours": [{"txn_id": int(r[0]), "acct_id": int(r[1]), "amount": float(r[2]),
