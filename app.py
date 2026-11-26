@@ -184,7 +184,7 @@ def score_and_store(account_id: int):
             is_dormant, txns, latest, result, db_ms = load_and_score(conn, account_id)
             cur = conn.cursor()
             w0 = time.perf_counter()
-            bind = {"a": account_id, "t": latest["txn_id"], "m": MODEL_VERSION,
+            bind = {"t": latest["txn_id"], "m": MODEL_VERSION,
                     "s": result["risk_score"], "l": result["risk_level"],
                     "f": 1 if result["is_flagged"] else 0,
                     "p": json.dumps(result["detected_patterns"])}
@@ -192,6 +192,8 @@ def score_and_store(account_id: int):
                         "is_flagged = :f, patterns = JSON(:p), scored_at = SYSTIMESTAMP "
                         "WHERE txn_id = :t AND model_version = :m", bind)
             if cur.rowcount == 0:
+                # the INSERT also needs the account id; UPDATE must not get it
+                bind["a"] = account_id
                 cur.execute("INSERT INTO ai_risk_score (acct_id, txn_id, model_version, "
                             "risk_score, risk_level, is_flagged, patterns) "
                             "VALUES (:a, :t, :m, :s, :l, :f, JSON(:p))", bind)
